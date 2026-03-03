@@ -1,0 +1,215 @@
+function [X_est_history, P_history] = alg_adaptive_fkf(SimData)
+% =========================================================================
+% alg_adaptive_fkf
+% 基于残差感知的自适应联邦卡尔曼滤波 (Adaptive FKF)
+% 核心原理：利用马氏距离判决系统是否发生突变/机动。
+% 平稳段 N=1 (等价于标准CKF，稳态精度高)
+% 突变段 N=20 (激活FKF协方差放大，抗突变能力强)
+% =========================================================================
+
+GPS_Meas = SimData.GPS_Meas;
+Radar_Meas = SimData.Radar_Meas;
+Radar_Pos = SimData.Pos_Radar;
+TotalSteps = length(SimData.Time);
+R_true_hist = SimData.R_true_hist;
+
+% 滤波器初始化
+X0 = zeros(6,1);
+P0 = diag([100, 100, 100, 1, 1, 1]); 
+
+% 过程噪声
+tuning_factor = 1;  % 尝试 10, 50, 100
+Q = diag(SimData.Q_bias_std.^2)* tuning_factor;
+F_rw = eye(6); 
+
+% 计算 Fixed R (你可根据需要修改)
+R_nominal = mean(R_true_hist, 2); 
+R_fix = diag(R_nominal)*10; 
+
+% --- 自适应 FKF 特有参数 ---
+N_max = 10;           % 触发突变时的最大分支数
+fkf_type = 'variable'; 
+
+% 【关键参数】：卡方分布阈值
+% 你的雷达量测是 2 维 (dist, range_rate)，自由度 m = 2。
+% 查卡方分布表：自由度为2时，置信度95%的阈值为 5.99；99%为 9.21。
+% 建议设置在 5.0 ~ 9.0 之间。值越小越敏感(越容易切成FKF)，值越大越平滑。
+chi2_threshold = 9.21;
+chi2_threshold=5;
+
+X_fkf = X0;
+P_fkf = P0;
+
+X_est_history = zeros(6, TotalSteps);
+P_history = zeros(6, 6, TotalSteps);
+f_func = @(x) F_rw * x;
+
+for k = 1:TotalSteps
+    Z_k = Radar_Meas(:, k);
+    meas_func = @(x) h_meas_bias(x, GPS_Meas(1:3,k), GPS_Meas(4:6,k), Radar_Pos);
+    
+    % 执行一步自适应 FKF
+    [X_fkf, P_fkf, current_N] = run_adaptive_fkf_step(X_fkf, P_fkf, Z_k, Q, R_fix, ...
+                                    f_func, meas_func, N_max, fkf_type, chi2_threshold);
+
+    % 【新增】：强制协方差下限保护 (防止过度自信导致坍塌)
+    % 设定位置方差最小不低于 0.01，速度方差最小不低于 1e-4
+    P_min_limit = diag([1e-2, 1e-2, 1e-2, 1e-4, 1e-4, 1e-4])*2000; 
+    % 提取当前对角线，与下限取最大值
+    P_diag = max(diag(P_fkf), diag(P_min_limit));
+    % 重新构造 P 阵 (保持非对角元素不变的简易写法，或直接重置对角线)
+    P_fkf = P_fkf - diag(diag(P_fkf)) + diag(P_diag);
+    
+    X_est_history(:, k) = X_fkf;
+    P_history(:, :, k) = P_fkf;
+    
+    % (可选) 打印观测到当前步使用的 N，方便调试观察何时发生了跳变
+    if current_N > 1
+        fprintf('Time %d: Jump detected! Adaptive N = %d\n', k, current_N);
+    end
+end
+
+end
+
+%% === 自适应 FKF 核心函数 ===
+function [x_post, P_post, N_adapt] = run_adaptive_fkf_step(x_p, P_p, z, Q, R, f_func, h_func, N_max, type, chi2_th)
+    n = length(x_p);
+    
+    % ---------------------------------------------------------
+    % 步骤 1：公共预测 (Common Prediction)
+    % ---------------------------------------------------------
+    [Xi, W] = get_cubature_points_P(x_p, P_p);
+    x_pred_pts = zeros(n, 2*n);
+    for j = 1:2*n
+        x_pred_pts(:,j) = f_func(Xi(:,j));
+    end
+    x_pred_common = x_pred_pts * W';
+    P_pred_common = Q;
+    for j = 1:2*n
+        err = x_pred_pts(:,j) - x_pred_common;
+        P_pred_common = P_pred_common + W(j) * (err * err');
+    end
+    
+    % ---------------------------------------------------------
+    % 步骤 2：测试性量测更新 (Test Measurement Update) 
+    % 用来计算新息和马氏距离，判断是否需要激活 FKF
+    % ---------------------------------------------------------
+    [Xi_test, W_test] = get_cubature_points_P(x_pred_common, P_pred_common);
+    z_pts_test = zeros(length(z), 2*n);
+    for j = 1:2*n
+        z_pts_test(:,j) = h_func(Xi_test(:,j));
+    end
+    z_pred_test = z_pts_test * W_test';
+    
+    Pzz_noiseless = zeros(length(z), length(z));
+    for j = 1:2*n
+        res_z = z_pts_test(:,j) - z_pred_test;
+        Pzz_noiseless = Pzz_noiseless + W_test(j) * (res_z * res_z');
+    end
+    
+    S_test = Pzz_noiseless + R; % 新息协方差
+    gamma = z - z_pred_test;    % 量测残差 (新息)
+    
+    % 计算马氏距离 (检验统计量 lambda)
+    lambda = gamma' * (S_test \ gamma); 
+    
+    % ---------------------------------------------------------
+    % 步骤 3：残差感知，自适应分配 N
+    % ---------------------------------------------------------
+    if lambda <= chi2_th
+        N_adapt = 1;      % 系统平稳，退化为标准单步 CKF，保证高精度
+    else
+        N_adapt = N_max;  % 发生突变，激活 FKF 强制放大协方差，捕获机动
+    end
+    
+    % ---------------------------------------------------------
+    % 步骤 4：执行 FKF 分数阶量测更新 (按照决定的 N_adapt)
+    % ---------------------------------------------------------
+    if strcmp(type, 'variable') && N_adapt > 1
+        idx = 1:N_adapt;
+        Delta = 1 ./ (idx .* (idx + 1));
+        Delta = Delta / sum(Delta);
+        Bar_Delta = repmat(1/N_adapt, 1, N_adapt); 
+    else
+        Delta = repmat(1/N_adapt, 1, N_adapt);
+        Bar_Delta = repmat(1/N_adapt, 1, N_adapt);
+    end
+    
+    P_inv_sum = zeros(n, n);
+    Px_inv_sum = zeros(n, 1);
+    
+    for i = 1:N_adapt
+        % 协方差放大 (如果是 N_adapt=1，相当于这里什么都不做)
+        P_pred_i = P_pred_common / Bar_Delta(i); 
+        R_i      = R / Delta(i);
+        x_pred_i = x_pred_common;
+        
+        % 如果 N_adapt=1，直接复用刚才 Test 步骤算出来的点和预测量，节省算力！
+        if N_adapt == 1
+            z_pred_i = z_pred_test;
+            Pzz = S_test;
+            Pxz = zeros(n, length(z));
+            for j = 1:2*n
+                res_z = z_pts_test(:,j) - z_pred_test;
+                res_x = Xi_test(:,j) - x_pred_i;
+                Pxz = Pxz + W_test(j) * (res_x * res_z');
+            end
+        else
+            % 否则，基于放大的 P 重新撒点！这是 FKF 的灵魂。
+            [Xi_m, W_m] = get_cubature_points_P(x_pred_i, P_pred_i);
+            z_pts = zeros(length(z), 2*n);
+            for j = 1:2*n
+                z_pts(:,j) = h_func(Xi_m(:,j));
+            end
+            z_pred_i = z_pts * W_m';
+            
+            Pzz = R_i; 
+            Pxz = zeros(n, length(z));
+            for j = 1:2*n
+                res_z = z_pts(:,j) - z_pred_i;
+                res_x = Xi_m(:,j) - x_pred_i;
+                Pzz = Pzz + W_m(j) * (res_z * res_z');
+                Pxz = Pxz + W_m(j) * (res_x * res_z');
+            end
+        end
+        
+        % 卡尔曼更新
+        K = Pxz / Pzz;
+        x_upd_i = x_pred_i + K * (z - z_pred_i);
+        P_upd_i = P_pred_i - K * Pzz * K';
+        P_upd_i = (P_upd_i + P_upd_i') / 2;
+        
+        % 融合累加
+        invP = pinv(P_upd_i); 
+        P_inv_sum = P_inv_sum + invP;
+        Px_inv_sum = Px_inv_sum + invP * x_upd_i;
+    end
+    
+    % 信息融合输出
+    P_post = pinv(P_inv_sum);
+    x_post = P_post * Px_inv_sum;
+    P_post = (P_post + P_post') / 2; 
+end
+
+function [Xi, W] = get_cubature_points_P(x, P)
+    n = length(x);
+    nPts = 2*n;
+    W = repmat(1/nPts, 1, nPts);
+    try
+        S = chol(P, 'lower');
+    catch
+        [V, D] = eig(P);
+        S = chol(V * max(D, 1e-8) * V', 'lower');
+    end
+    Xi = repmat(x, 1, nPts) + S * sqrt(n) * [eye(n), -eye(n)];
+end
+
+function z = h_meas_bias(bias_state, gps_pos, gps_vel, radar_pos)
+    pos_est = gps_pos - bias_state(1:3);
+    vel_est = gps_vel - bias_state(4:6);
+    diff = pos_est - radar_pos;
+    dist = norm(diff);
+    if dist < 1e-3, dist = 1e-3; end
+    range_rate = dot(diff, vel_est) / dist;
+    z = [dist; range_rate];
+end

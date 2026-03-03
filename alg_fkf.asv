@@ -1,0 +1,314 @@
+% function [X_est_history, P_history] = alg_fkf(SimData)
+% % =========================================================================
+% % alg_fkf
+% % 联邦卡尔曼滤波 (FKF) - 无畸变基准版
+% % 修正了原论文 Sigma 点过度发散导致的卡尔曼增益衰减问题
+% % 目标：在非粗差段，与标准 SRCKF 完美对齐。
+% % =========================================================================
+% 
+% GPS_Meas = SimData.GPS_Meas;
+% Radar_Meas = SimData.Radar_Meas;
+% Radar_Pos = SimData.Pos_Radar;
+% TotalSteps = length(SimData.Time);
+% outlier_ranges = SimData.outlier_ranges;
+% R_true_hist = SimData.R_true_hist;
+% Time = SimData.Time;
+% 
+% % 严格对齐标准 SRCKF 参数
+% X0 = zeros(6,1);
+% P0 = diag([100, 100, 100, 1, 1, 1]); 
+% Q = diag(SimData.Q_bias_std.^2);
+% F_rw = eye(6); 
+% 
+% is_normal_mask = true(1, TotalSteps);
+% for k = 1:TotalSteps
+%     t = Time(k);
+%     for w = 1:size(outlier_ranges, 1)
+%         if t >= outlier_ranges(w,1) && t <= outlier_ranges(w,2)
+%             is_normal_mask(k) = false; 
+%             break;
+%         end
+%     end
+% end
+% R_nominal = mean(R_true_hist(:, is_normal_mask), 2); 
+% R_fix = diag(R_nominal)*10; 
+% 
+% N_fkf = 20;           
+% fkf_type = 'variable'; 
+% 
+% X_fkf = X0;
+% P_fkf = P0;
+% 
+% X_est_history = zeros(6, TotalSteps);
+% P_history = zeros(6, 6, TotalSteps);
+% f_func = @(x) F_rw * x;
+% 
+% for k = 1:TotalSteps
+%     Z_k = Radar_Meas(:, k);
+%     meas_func = @(x) h_meas_bias(x, GPS_Meas(1:3,k), GPS_Meas(4:6,k), Radar_Pos);
+% 
+%     [X_fkf, P_fkf] = run_fkf_step_nodistortion(X_fkf, P_fkf, Z_k, Q, R_fix, f_func, meas_func, N_fkf, fkf_type);
+% 
+%     X_est_history(:, k) = X_fkf;
+%     P_history(:, :, k) = P_fkf;
+% end
+% 
+% end
+% 
+% function [x_post, P_post] = run_fkf_step_nodistortion(x_p, P_p, z, Q, R, f_func, h_func, N, type)
+%     n = length(x_p);
+% 
+%     if strcmp(type, 'variable')
+%         idx = 1:N;
+%         Delta = 1 ./ (idx .* (idx + 1));
+%         Delta = Delta / sum(Delta);
+%         Bar_Delta = repmat(1/N, 1, N); 
+%     else
+%         Delta = repmat(1/N, 1, N);
+%         Bar_Delta = repmat(1/N, 1, N);
+%     end
+% 
+%     % 1. 统一预测
+%     [Xi, W] = get_cubature_points_P(x_p, P_p);
+%     x_pred_pts = zeros(n, 2*n);
+%     for j = 1:2*n
+%         x_pred_pts(:,j) = f_func(Xi(:,j));
+%     end
+%     x_pred_common = x_pred_pts * W';
+%     P_pred_common = Q;
+%     for j = 1:2*n
+%         err = x_pred_pts(:,j) - x_pred_common;
+%         P_pred_common = P_pred_common + W(j) * (err * err');
+%     end
+% 
+%     % 2. 在正常无畸变的协方差上计算量测非线性传播
+%     [Xi_m, W_m] = get_cubature_points_P(x_pred_common, P_pred_common);
+%     z_pts = zeros(length(z), 2*n);
+%     for j = 1:2*n
+%         z_pts(:,j) = h_func(Xi_m(:,j));
+%     end
+%     z_pred_common = z_pts * W_m';
+% 
+%     Pzz_noiseless_common = zeros(length(z), length(z));
+%     Pxz_common = zeros(n, length(z));
+%     for j = 1:2*n
+%         res_z = z_pts(:,j) - z_pred_common;
+%         res_x = Xi_m(:,j) - x_pred_common;
+%         Pzz_noiseless_common = Pzz_noiseless_common + W_m(j) * (res_z * res_z');
+%         Pxz_common = Pxz_common + W_m(j) * (res_x * res_z');
+%     end
+% 
+%     P_inv_sum = zeros(n, n);
+%     Px_inv_sum = zeros(n, 1);
+% 
+%     % 3. 分数阶卡尔曼更新 (仅按比例分配理论权重)
+%     for i = 1:N
+%         delta_i = Delta(i);
+%         bar_delta_i = Bar_Delta(i);
+% 
+%         P_pred_i = P_pred_common / bar_delta_i;
+%         Pxz_i    = Pxz_common / bar_delta_i;
+%         Pzz_i    = Pzz_noiseless_common / bar_delta_i + R / delta_i;
+% 
+%         K_i = Pxz_i / Pzz_i;
+%         x_upd_i = x_pred_common + K_i * (z - z_pred_common);
+%         P_upd_i = P_pred_i - K_i * Pzz_i * K_i';
+% 
+%         P_upd_i = (P_upd_i + P_upd_i') / 2;
+% 
+%         invP = pinv(P_upd_i);
+%         P_inv_sum = P_inv_sum + invP;
+%         Px_inv_sum = Px_inv_sum + invP * x_upd_i;
+%     end
+% 
+%     % 4. 融合
+%     P_post = pinv(P_inv_sum);
+%     x_post = P_post * Px_inv_sum;
+%     P_post = (P_post + P_post') / 2; 
+% end
+% 
+% function [Xi, W] = get_cubature_points_P(x, P)
+%     n = length(x);
+%     nPts = 2*n;
+%     W = repmat(1/nPts, 1, nPts);
+%     try
+%         S = chol(P, 'lower');
+%     catch
+%         [V, D] = eig(P);
+%         S = chol(V * max(D, 1e-8) * V', 'lower');
+%     end
+%     Xi = repmat(x, 1, nPts) + S * sqrt(n) * [eye(n), -eye(n)];
+% end
+% 
+% function z = h_meas_bias(bias_state, gps_pos, gps_vel, radar_pos)
+%     pos_est = gps_pos - bias_state(1:3);
+%     vel_est = gps_vel - bias_state(4:6);
+%     diff = pos_est - radar_pos;
+%     dist = norm(diff);
+%     if dist < 1e-3, dist = 1e-3; end
+%     range_rate = dot(diff, vel_est) / dist;
+%     z = [dist; range_rate];
+% end
+function [X_est_history, P_history] = alg_fkf(SimData)
+% =========================================================================
+% alg_fkf
+% 联邦卡尔曼滤波 (FKF) - 原汁原味复刻版 (强非线性克星)
+% 核心：放大预测协方差 P_pred 后再进行 Sigma 点采样！
+% =========================================================================
+
+GPS_Meas = SimData.GPS_Meas;
+Radar_Meas = SimData.Radar_Meas;
+Radar_Pos = SimData.Pos_Radar;
+TotalSteps = length(SimData.Time);
+outlier_ranges = SimData.outlier_ranges;
+R_true_hist = SimData.R_true_hist;
+Time = SimData.Time;
+
+% 滤波器初始化
+X0 = zeros(6,1);
+P0 = diag([100, 100, 100, 1, 1, 1]); 
+
+% 过程噪声 (保持1倍 tuning)
+Q_std_true = SimData.Q_bias_std;
+Q = diag(Q_std_true.^2);
+F_rw = eye(6); 
+
+% 计算 Fixed R (避开可能的粗差段)
+is_normal_mask = true(1, TotalSteps);
+for k = 1:TotalSteps
+    t = Time(k);
+    for w = 1:size(outlier_ranges, 1)
+        if t >= outlier_ranges(w,1) && t <= outlier_ranges(w,2)
+            is_normal_mask(k) = false; 
+            break;
+        end
+    end
+end
+R_nominal = mean(R_true_hist(:, is_normal_mask), 2); 
+R_fix = diag(R_nominal)*10; 
+
+% --- FKF 特有参数 ---
+N_fkf = 10;           
+fkf_type = 'ivariable'; 
+
+X_fkf = X0;
+P_fkf = P0;
+
+X_est_history = zeros(6, TotalSteps);
+P_history = zeros(6, 6, TotalSteps);
+f_func = @(x) F_rw * x;
+
+for k = 1:TotalSteps
+    Z_k = Radar_Meas(:, k);
+    meas_func = @(x) h_meas_bias(x, GPS_Meas(1:3,k), GPS_Meas(4:6,k), Radar_Pos);
+    
+    [X_fkf, P_fkf] = run_authentic_fkf_step(X_fkf, P_fkf, Z_k, Q, R_fix, f_func, meas_func, N_fkf, fkf_type);
+    
+    X_est_history(:, k) = X_fkf;
+    P_history(:, :, k) = P_fkf;
+end
+
+end
+
+%% === 原汁原味 FKF 核心函数 ===
+function [x_post, P_post] = run_authentic_fkf_step(x_p, P_p, z, Q, R, f_func, h_func, N, type)
+    n = length(x_p);
+    
+    % 1. 设置权重
+    if strcmp(type, 'variable')
+        idx = 1:N;
+        Delta = 1 ./ (idx .* (idx + 1));
+        Delta = Delta / sum(Delta);
+        Bar_Delta = repmat(1/N, 1, N); 
+    else
+        Delta = repmat(1/N, 1, N);
+        Bar_Delta = repmat(1/N, 1, N);
+    end
+    
+    % 2. 公共预测 (Common Prediction) - 基于上一时刻的未放大状态
+    [Xi, W] = get_cubature_points_P(x_p, P_p);
+    x_pred_pts = zeros(n, 2*n);
+    for j = 1:2*n
+        x_pred_pts(:,j) = f_func(Xi(:,j));
+    end
+    x_pred_common = x_pred_pts * W';
+    P_pred_common = Q;
+    for j = 1:2*n
+        err = x_pred_pts(:,j) - x_pred_common;
+        P_pred_common = P_pred_common + W(j) * (err * err');
+    end
+    
+    P_inv_sum = zeros(n, n);
+    Px_inv_sum = zeros(n, 1);
+    
+    % 3. 分数阶更新 (Fractional Measurement Update)
+    for i = 1:N
+        % =========================================================
+        % 【FKF 灵魂所在】：强制放大先验协方差 P !
+        % =========================================================
+        P_pred_i = P_pred_common / Bar_Delta(i); 
+        R_i      = R / Delta(i);
+        x_pred_i = x_pred_common;
+        
+        % =========================================================
+        % 基于【放大后的 P_pred_i】进行采样！
+        % 此时 Sigma 点会被向外推远 sqrt(N) 倍，从而探索广阔的非线性空间
+        % =========================================================
+        [Xi_m, W_m] = get_cubature_points_P(x_pred_i, P_pred_i);
+        z_pts = zeros(length(z), 2*n);
+        for j = 1:2*n
+            z_pts(:,j) = h_func(Xi_m(:,j));
+        end
+        z_pred_i = z_pts * W_m';
+        
+        % 计算新息协方差
+        Pzz = R_i; 
+        Pxz = zeros(n, length(z));
+        for j = 1:2*n
+            res_z = z_pts(:,j) - z_pred_i;
+            res_x = Xi_m(:,j) - x_pred_i;
+            Pzz = Pzz + W_m(j) * (res_z * res_z');
+            Pxz = Pxz + W_m(j) * (res_x * res_z');
+        end
+        
+        % 卡尔曼更新
+        K = Pxz / Pzz;
+        x_upd_i = x_pred_i + K * (z - z_pred_i);
+        P_upd_i = P_pred_i - K * Pzz * K';
+        
+        P_upd_i = (P_upd_i + P_upd_i') / 2;
+        
+        % 融合累加
+        invP = pinv(P_upd_i); 
+        P_inv_sum = P_inv_sum + invP;
+        Px_inv_sum = Px_inv_sum + invP * x_upd_i;
+    end
+    
+    % 4. 信息融合输出
+    P_post = pinv(P_inv_sum);
+    x_post = P_post * Px_inv_sum;
+    P_post = (P_post + P_post') / 2; 
+end
+
+function [Xi, W] = get_cubature_points_P(x, P)
+    n = length(x);
+    nPts = 2*n;
+    W = repmat(1/nPts, 1, nPts);
+    try
+        S = chol(P, 'lower');
+    catch
+        [V, D] = eig(P);
+        S = chol(V * max(D, 1e-8) * V', 'lower');
+    end
+    Xi = repmat(x, 1, nPts) + S * sqrt(n) * [eye(n), -eye(n)];
+end
+
+function z = h_meas_bias(bias_state, gps_pos, gps_vel, radar_pos)
+    pos_est = gps_pos - bias_state(1:3);
+    vel_est = gps_vel - bias_state(4:6);
+    diff = pos_est - radar_pos;
+    dist = norm(diff);
+    if dist < 1e-3, dist = 1e-3; end
+    range_rate = dot(diff, vel_est) / dist;
+    z = [dist; range_rate];
+end
